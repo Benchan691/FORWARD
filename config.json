@@ -1,0 +1,14 @@
+{
+  "folders": {
+    "pure_fitness_parent_id": "34663383",
+    "alert_call_folder_id": "34826318"
+  },
+  "forward": {
+    "to": ["ben.chan@citictel-cpc.com"],
+    "cc": ["tommy.chan@citictel-cpc.com"],
+    "limit": 50,
+    "signature_id": "25ea6e17-aec8-4af4-8ab4-ac2795396549",
+    "signature_name": "SOC Team (Zimbra0020-0020CITIC0020Telecom0020CPC0020SOC@example.com)",
+    "signature_position": "down"
+  }
+}

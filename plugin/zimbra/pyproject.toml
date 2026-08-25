@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zimbra-soap-client"
+version = "1.0.0"
+description = "Zimbra SOAP client helpers for auth, mail, and attachments"
+requires-python = ">=3.9"
+
+[tool.setuptools]
+py-modules = ["zimbra"]
