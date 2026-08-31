@@ -1,8 +1,16 @@
 {
-  "folders": {
-    "pure_fitness_parent_id": "34663383",
-    "alert_call_folder_id": "34792697"
-  },
+  "folders": [
+    {
+      "pure_fitness_parent_id": "34663383",
+      "folder_id": "34663472",
+      "folder_name": "Alert - Ignore"
+    },
+    {
+      "pure_fitness_parent_id": "34663383",
+      "folder_id": "34859504",
+      "folder_name": "Alert - High (Plz Follow PlayBook)"
+    }
+  ],
   "forward": {
     "to": ["ben.chan@citictel-cpc.com"],
     "cc": ["tommy.chan@citictel-cpc.com", "sunshine.wong@citictel-cpc.com"],
