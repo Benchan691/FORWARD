@@ -6,6 +6,7 @@ import html
 import json
 import os
 import re
+import argparse
 from pathlib import Path
 
 from zimbra_client import ZimbraClient
@@ -133,14 +134,38 @@ def forward_message(client, message_id, subject, to, cc, signature_id, signature
     )
 
 
-def main() -> None:
+def resolve_folder_id(client, parent_id: str, folder_name: str) -> str:
+    parent_id = str(parent_id or "").strip()
+    folder_name = str(folder_name or "").strip()
+    if not parent_id:
+        raise ValueError("Missing pure_fitness_parent_id")
+    if not folder_name:
+        raise ValueError("Missing folder_name")
+
+    matches = [
+        folder
+        for folder in client.list_folders(folder_id=parent_id)
+        if folder.name == folder_name and folder.parent_id == parent_id
+    ]
+    if not matches:
+        raise ValueError(
+            f'Folder {folder_name!r} not found under parent id={parent_id}'
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            f'Multiple folders named {folder_name!r} under parent id={parent_id}'
+        )
+    return matches[0].id
+
+
+def main(*, dry_run: bool = False) -> None:
     load_env()
     app_cfg = load_config()
     zimbra_cfg = build_zimbra_cfg()
 
-    folder_id = str((app_cfg.get("folders") or {}).get("alert_call_folder_id") or "").strip()
-    if not folder_id:
-        raise ValueError("Missing folders.alert_call_folder_id in config.json")
+    folders_cfg = app_cfg.get("folders")
+    if not isinstance(folders_cfg, list) or not folders_cfg:
+        raise ValueError("Missing or invalid folders in config.json (expected non-empty list)")
 
     forward_cfg = app_cfg.get("forward") or {}
     to_addrs = forward_cfg.get("to") or []
@@ -156,40 +181,80 @@ def main() -> None:
 
     with ZimbraClient(zimbra_cfg) as client:
         print(f"Zimbra login OK for {client.config.email}")
-        print(f"Scanning unread in folder id={folder_id} (limit={limit})")
+        if dry_run:
+            print("DRY-RUN mode: messages will not be forwarded or marked read")
         print(
             f"Signature id={signature_id or '-'} name={signature_name or '-'} "
             f"position={signature_position}"
         )
 
-        results = client.search_messages(query="is:unread", folder_id=folder_id, limit=limit)
-        if not results.messages:
-            print("No unread messages found.")
-            return
-
-        print(f"Found {len(results.messages)} unread message(s)")
         forwarded = 0
         failed = 0
-        for summary in results.messages:
-            try:
-                forward_message(
-                    client,
-                    summary.id,
-                    summary.subject,
-                    to=to_addrs,
-                    cc=cc_addrs,
-                    signature_id=signature_id,
-                    signature_name=signature_name,
-                )
-                client.mark_read(summary.id)
-                forwarded += 1
-                print(f"OK  id={summary.id} subject={summary.subject!r}")
-            except Exception as exc:
-                failed += 1
-                print(f"FAIL id={summary.id} subject={summary.subject!r} error={exc}")
+        for index, folder_cfg in enumerate(folders_cfg, start=1):
+            if not isinstance(folder_cfg, dict):
+                raise ValueError(f"folders[{index - 1}] must be an object")
 
-        print(f"Done. forwarded={forwarded} failed={failed}")
+            parent_id = str(folder_cfg.get("pure_fitness_parent_id") or "").strip()
+            folder_name = str(folder_cfg.get("folder_name") or "").strip()
+            folder_id = str(
+                folder_cfg.get("folder_id") or folder_cfg.get("alert_call_folder_id") or ""
+            ).strip()
+            if not folder_id and folder_name:
+                folder_id = resolve_folder_id(client, parent_id, folder_name)
+            elif not folder_id:
+                raise ValueError(
+                    f"Missing folders[{index - 1}].folder_id or "
+                    f"folders[{index - 1}].folder_name in config.json"
+                )
+
+            print(
+                f"Scanning unread in folder name={folder_name or '-'} "
+                f"parent_id={parent_id or '-'} id={folder_id} (limit={limit})"
+            )
+            results = client.search_messages(query="is:unread", folder_id=folder_id, limit=limit)
+            if not results.messages:
+                print("No unread messages found.")
+                continue
+
+            print(f"Found {len(results.messages)} unread message(s)")
+            for summary in results.messages:
+                try:
+                    if dry_run:
+                        print(
+                            f"DRY-RUN id={summary.id} subject={summary.subject!r} "
+                            f"to={to_addrs} cc={cc_addrs}"
+                        )
+                        forwarded += 1
+                        continue
+
+                    forward_message(
+                        client,
+                        summary.id,
+                        summary.subject,
+                        to=to_addrs,
+                        cc=cc_addrs,
+                        signature_id=signature_id,
+                        signature_name=signature_name,
+                    )
+                    client.mark_read(summary.id)
+                    forwarded += 1
+                    print(f"OK  id={summary.id} subject={summary.subject!r}")
+                except Exception as exc:
+                    failed += 1
+                    print(f"FAIL id={summary.id} subject={summary.subject!r} error={exc}")
+
+        if dry_run:
+            print(f"Done. would_forward={forwarded} failed={failed}")
+        else:
+            print(f"Done. forwarded={forwarded} failed={failed}")
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Scan unread alerts and forward them.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="List unread messages without forwarding or marking them read",
+    )
+    args = parser.parse_args()
+    main(dry_run=args.dry_run)
