@@ -4,8 +4,8 @@
     "alert_call_folder_id": "34792697"
   },
   "forward": {
-    "to": ["ben.chan@citictel-cpc.com"],
-    "cc": ["tommy.chan@citictel-cpc.com", "sunshine.wong@citictel-cpc.com"],
+    "to": ["parco.tsoi@tech-trans.com","Wilson.fung@tech-trans.com","alfred.poon@tech-trans.com"],
+    "cc": ["tommy.chan@citictel-cpc.com", "sunshine.wong@citictel-cpc.com","soc@citictel-cpc.com"],
     "limit": 50,
     "signature_id": "25ea6e17-aec8-4af4-8ab4-ac2795396549",
     "signature_name": "SOC Team (Zimbra0020-0020CITIC0020Telecom0020CPC0020SOC@example.com)",
