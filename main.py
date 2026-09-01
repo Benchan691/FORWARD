@@ -129,7 +129,10 @@ def resolve_folder_id(client, parent_id: str, folder_name: str) -> str:
     return matches[0].id
 
 
-def main(*, dry_run: bool = False) -> None:
+def main(*, dry_run: bool = False, test: bool = False) -> None:
+    if dry_run and test:
+        raise ValueError("Use only one of --dry-run or --test")
+
     load_env()
     app_cfg = load_config()
 
@@ -146,20 +149,24 @@ def main(*, dry_run: bool = False) -> None:
     if signature_position not in {"up", "down"}:
         raise ValueError('forward.signature_position must be "up" or "down"')
 
-    if dry_run:
+    use_test_recipients = dry_run or test
+    if use_test_recipients:
         to_addrs = test_forward_cfg.get("to") or []
         cc_addrs = test_forward_cfg.get("cc") or []
-        search_query = ""
-        search_limit = 1
         if not to_addrs:
             raise ValueError("Missing test_forward.to recipients in config.json")
     else:
         to_addrs = forward_cfg.get("to") or []
         cc_addrs = forward_cfg.get("cc") or []
-        search_query = "is:unread"
-        search_limit = limit
         if not to_addrs:
             raise ValueError("Missing forward.to recipients in config.json")
+
+    if dry_run:
+        search_query = ""
+        search_limit = 1
+    else:
+        search_query = "is:unread"
+        search_limit = limit
 
     zimbra_cfg = {
         "host": os.environ.get("SEND_EMAIL_HOST", "").strip(),
@@ -171,8 +178,13 @@ def main(*, dry_run: bool = False) -> None:
         print(f"Zimbra login OK for {client.config.email}")
         if dry_run:
             print(
-                "DRY-RUN mode: ignore unread filter, forward one message to "
+                "DRY-RUN mode: ignore unread filter, send one message to "
                 "test_forward recipients, and do not mark it read"
+            )
+        elif test:
+            print(
+                "TEST mode: unread only, send to test_forward recipients, "
+                "and mark messages read"
             )
         print(f"Forward to={to_addrs} cc={cc_addrs}")
         print(
@@ -235,7 +247,8 @@ def main(*, dry_run: bool = False) -> None:
 
                     client.mark_read(summary.id)
                     forwarded += 1
-                    print(f"OK  id={summary.id} subject={summary.subject!r}")
+                    prefix = "TEST OK" if test else "OK"
+                    print(f"{prefix}  id={summary.id} subject={summary.subject!r}")
                 except SkipForward as exc:
                     skipped += 1
                     print(f"SKIP id={summary.id} subject={summary.subject!r} reason={exc}")
@@ -251,10 +264,16 @@ def main(*, dry_run: bool = False) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Scan unread alerts and forward them.")
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--dry-run",
         action="store_true",
-        help="Forward one message (read or unread) to test_forward recipients without marking it read",
+        help="Send one message (read or unread) to test_forward recipients without marking it read",
+    )
+    mode.add_argument(
+        "--test",
+        action="store_true",
+        help="Send unread messages to test_forward recipients and mark them read",
     )
     args = parser.parse_args()
-    main(dry_run=args.dry_run)
+    main(dry_run=args.dry_run, test=args.test)
