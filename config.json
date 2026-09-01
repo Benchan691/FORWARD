@@ -15,7 +15,7 @@
     "signature_position": "down"
   },
   "test_forward": {
-    "to": ["ben.chan@citictel-cpc.com", "tommy.chan@citictel-cpc.com", "sunshine.wong@citictel-cpc.com"],
-    "cc": []
+    "to": ["tommy.chan@citictel-cpc.com", "sunshine.wong@citictel-cpc.com"],
+    "cc": ["ben.chan@citictel-cpc.com"]
   }
 }
