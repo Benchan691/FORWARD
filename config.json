@@ -2,8 +2,8 @@
   "folders": [
     {
       "pure_fitness_parent_id": "34663383",
-      "folder_id": "34663472",
-      "folder_name": "Alert - Ignore"
+      "folder_id": "34792697",
+      "folder_name": "Alert - Reply from Cloudfall"
     },
     {
       "pure_fitness_parent_id": "34663383",
@@ -18,5 +18,9 @@
     "signature_id": "25ea6e17-aec8-4af4-8ab4-ac2795396549",
     "signature_name": "SOC Team (Zimbra0020-0020CITIC0020Telecom0020CPC0020SOC@example.com)",
     "signature_position": "down"
+  },
+  "test_forward": {
+    "to": ["ben.chan@citictel-cpc.com", "tommy.chan@citictel-cpc.com", "sunshine.wong@citictel-cpc.com"],
+    "cc": []
   }
 }
