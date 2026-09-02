@@ -6,6 +6,8 @@ import argparse
 import html
 import json
 import os
+import sys
+import traceback
 from pathlib import Path
 
 from zimbra_client import Attachment, ZimbraClient
@@ -18,6 +20,10 @@ ROOT = Path(__file__).resolve().parent
 DEFAULT_FORWARD_SIGNATURE_ID = "25ea6e17-aec8-4af4-8ab4-ac2795396549"
 DEFAULT_FORWARD_SIGNATURE_NAME = (
     "SOC Team (Zimbra0020-0020CITIC0020Telecom0020SOC@example.com)"
+)
+
+ERROR_ALERT_SUBJECT = (
+    "[ACTION REQUIRED] Alert forwarder failed — send customer notification manually"
 )
 
 
@@ -40,6 +46,192 @@ def load_config(path: Path | None = None) -> dict:
         raise FileNotFoundError(f"config.json not found: {config_path}")
     with config_path.open(encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def _zimbra_config_from_env() -> dict:
+    return {
+        "host": os.environ.get("SEND_EMAIL_HOST", "").strip(),
+        "email": os.environ.get("SEND_EMAIL_USER", "").strip(),
+        "password": os.environ.get("SEND_EMAIL_PASSWORD", "").strip(),
+        "verify_ssl": True,
+    }
+
+
+def _run_mode_label(*, dry_run: bool, test: bool) -> str:
+    if dry_run:
+        return "dry-run"
+    if test:
+        return "test"
+    return "normal"
+
+
+def _format_recipient_list(addresses) -> str:
+    if not addresses:
+        return "(none)"
+    return ", ".join(str(addr) for addr in addresses)
+
+
+def _build_error_alert_bodies(payload: dict) -> tuple[str, str]:
+    action_lines = [
+        "ACTION REQUIRED",
+        "===============",
+        (
+            "Automatic customer notification failed. The SOC team must manually send "
+            "the customer notification now. Do not assume the customer was notified."
+        ),
+        "",
+        f"Run mode: {payload.get('run_mode', 'unknown')}",
+        f"Customer To: {_format_recipient_list(payload.get('customer_to'))}",
+        f"Customer Cc: {_format_recipient_list(payload.get('customer_cc'))}",
+        (
+            f"Forwarded: {payload.get('forwarded', 0)} | "
+            f"Skipped: {payload.get('skipped', 0)} | "
+            f"Failed: {payload.get('failed', 0)}"
+        ),
+        "",
+        (
+            "Failed source messages were not marked read and remain unread in the "
+            "source folder."
+        ),
+    ]
+
+    failures = payload.get("failures") or []
+    if failures:
+        action_lines.extend(["", "Failed messages:"])
+        for item in failures:
+            action_lines.append(
+                f"- id={item.get('id', '-')} "
+                f"subject={item.get('subject', '-')!r} "
+                f"folder={item.get('folder', '-')} "
+                f"error={item.get('error', '-')}"
+            )
+
+    fatal_error = payload.get("fatal_error")
+    if fatal_error:
+        action_lines.extend(
+            [
+                "",
+                "Fatal error:",
+                f"Type: {fatal_error.get('type', 'unknown')}",
+                f"Message: {fatal_error.get('message', '')}",
+                "",
+                "Traceback:",
+                fatal_error.get("traceback", "").rstrip(),
+            ]
+        )
+
+    text_body = "\n".join(action_lines)
+
+    html_parts = [
+        "<h2 style=\"color:#b91c1c;\">ACTION REQUIRED</h2>",
+        (
+            "<p><strong>Automatic customer notification failed.</strong> "
+            "The SOC team must <strong>manually send the customer notification</strong> "
+            "now. Do not assume the customer was notified.</p>"
+        ),
+        "<ul>",
+        f"<li><strong>Run mode:</strong> {html.escape(str(payload.get('run_mode', 'unknown')))}</li>",
+        (
+            f"<li><strong>Customer To:</strong> "
+            f"{html.escape(_format_recipient_list(payload.get('customer_to')))}</li>"
+        ),
+        (
+            f"<li><strong>Customer Cc:</strong> "
+            f"{html.escape(_format_recipient_list(payload.get('customer_cc')))}</li>"
+        ),
+        (
+            f"<li><strong>Counts:</strong> forwarded={payload.get('forwarded', 0)}, "
+            f"skipped={payload.get('skipped', 0)}, failed={payload.get('failed', 0)}</li>"
+        ),
+        "</ul>",
+        (
+            "<p>Failed source messages were <strong>not marked read</strong> and remain "
+            "unread in the source folder.</p>"
+        ),
+    ]
+
+    if failures:
+        html_parts.append("<h3>Failed messages</h3><ul>")
+        for item in failures:
+            html_parts.append(
+                "<li>"
+                f"<strong>id:</strong> {html.escape(str(item.get('id', '-')))}<br>"
+                f"<strong>subject:</strong> {html.escape(str(item.get('subject', '-')))}<br>"
+                f"<strong>folder:</strong> {html.escape(str(item.get('folder', '-')))}<br>"
+                f"<strong>error:</strong> {html.escape(str(item.get('error', '-')))}"
+                "</li>"
+            )
+        html_parts.append("</ul>")
+
+    if fatal_error:
+        html_parts.extend(
+            [
+                "<h3>Fatal error</h3>",
+                (
+                    f"<p><strong>Type:</strong> "
+                    f"{html.escape(str(fatal_error.get('type', 'unknown')))}<br>"
+                    f"<strong>Message:</strong> "
+                    f"{html.escape(str(fatal_error.get('message', '')))}</p>"
+                ),
+                (
+                    "<pre style=\"white-space:pre-wrap;background:#f8fafc;"
+                    "padding:12px;border:1px solid #e2e8f0;\">"
+                    f"{html.escape(fatal_error.get('traceback', '').rstrip())}"
+                    "</pre>"
+                ),
+            ]
+        )
+
+    html_body = "\n".join(html_parts)
+    return text_body, html_body
+
+
+def send_error_alert(client, error_to, payload: dict) -> None:
+    text_body, html_body = _build_error_alert_bodies(payload)
+    client.send_message(
+        to=error_to,
+        cc=None,
+        subject=ERROR_ALERT_SUBJECT,
+        text=text_body,
+        html=html_body,
+        attachments=None,
+    )
+
+
+def notify_soc_on_error(*, error_to, payload: dict, client=None) -> None:
+    if not error_to:
+        print("WARNING: error_to is empty; SOC alert email not sent")
+        return
+
+    try:
+        if client is None:
+            load_env()
+            with ZimbraClient(_zimbra_config_from_env()) as alert_client:
+                send_error_alert(alert_client, error_to, payload)
+        else:
+            send_error_alert(client, error_to, payload)
+        print(f"SOC alert sent to error_to={error_to}")
+    except Exception as exc:
+        print(f"WARNING: failed to send SOC alert email: {exc}")
+
+
+def _error_alert_context(
+    app_cfg: dict,
+    *,
+    dry_run: bool,
+    test: bool,
+) -> tuple[list, list, list]:
+    error_to = app_cfg.get("error_to") or []
+    forward_cfg = app_cfg.get("forward") or {}
+    test_forward_cfg = app_cfg.get("test_forward") or {}
+    use_test_recipients = dry_run or test
+    if use_test_recipients:
+        customer_to = test_forward_cfg.get("to") or []
+        customer_cc = test_forward_cfg.get("cc") or []
+    else:
+        customer_to = forward_cfg.get("to") or []
+        customer_cc = forward_cfg.get("cc") or []
+    return error_to, customer_to, customer_cc
 
 
 def _forward_attachments(client, source):
@@ -135,6 +327,9 @@ def main(*, dry_run: bool = False, test: bool = False) -> None:
 
     load_env()
     app_cfg = load_config()
+    error_to, customer_to, customer_cc = _error_alert_context(
+        app_cfg, dry_run=dry_run, test=test
+    )
 
     folders_cfg = app_cfg.get("folders")
     if not isinstance(folders_cfg, list) or not folders_cfg:
@@ -168,12 +363,7 @@ def main(*, dry_run: bool = False, test: bool = False) -> None:
         search_query = "is:unread"
         search_limit = limit
 
-    zimbra_cfg = {
-        "host": os.environ.get("SEND_EMAIL_HOST", "").strip(),
-        "email": os.environ.get("SEND_EMAIL_USER", "").strip(),
-        "password": os.environ.get("SEND_EMAIL_PASSWORD", "").strip(),
-        "verify_ssl": True,
-    }
+    zimbra_cfg = _zimbra_config_from_env()
     with ZimbraClient(zimbra_cfg) as client:
         print(f"Zimbra login OK for {client.config.email}")
         if dry_run:
@@ -195,6 +385,7 @@ def main(*, dry_run: bool = False, test: bool = False) -> None:
         forwarded = 0
         failed = 0
         skipped = 0
+        failure_details: list[dict] = []
         for index, folder_cfg in enumerate(folders_cfg, start=1):
             if not isinstance(folder_cfg, dict):
                 raise ValueError(f"folders[{index - 1}] must be an object")
@@ -212,6 +403,7 @@ def main(*, dry_run: bool = False, test: bool = False) -> None:
                     f"folders[{index - 1}].folder_name in config.json"
                 )
 
+            folder_label = folder_name or folder_id
             scan_label = "any" if dry_run else "unread"
             print(
                 f"Scanning {scan_label} in folder name={folder_name or '-'} "
@@ -254,12 +446,69 @@ def main(*, dry_run: bool = False, test: bool = False) -> None:
                     print(f"SKIP id={summary.id} subject={summary.subject!r} reason={exc}")
                 except Exception as exc:
                     failed += 1
+                    failure_details.append(
+                        {
+                            "id": summary.id,
+                            "subject": summary.subject,
+                            "folder": folder_label,
+                            "error": str(exc),
+                        }
+                    )
                     print(f"FAIL id={summary.id} subject={summary.subject!r} error={exc}")
 
             if dry_run and forwarded:
                 break
 
         print(f"Done. forwarded={forwarded} skipped={skipped} failed={failed}")
+
+        if failed > 0:
+            notify_soc_on_error(
+                error_to=error_to,
+                client=client,
+                payload={
+                    "run_mode": _run_mode_label(dry_run=dry_run, test=test),
+                    "customer_to": customer_to,
+                    "customer_cc": customer_cc,
+                    "forwarded": forwarded,
+                    "skipped": skipped,
+                    "failed": failed,
+                    "failures": failure_details,
+                    "fatal_error": None,
+                },
+            )
+            raise SystemExit(1)
+
+
+def _notify_fatal_error(exc: BaseException, *, dry_run: bool, test: bool) -> None:
+    error_to: list = []
+    customer_to: list = []
+    customer_cc: list = []
+    try:
+        load_env()
+        app_cfg = load_config()
+        error_to, customer_to, customer_cc = _error_alert_context(
+            app_cfg, dry_run=dry_run, test=test
+        )
+    except Exception as load_exc:
+        print(f"WARNING: could not load config for SOC alert: {load_exc}")
+
+    notify_soc_on_error(
+        error_to=error_to,
+        payload={
+            "run_mode": _run_mode_label(dry_run=dry_run, test=test),
+            "customer_to": customer_to,
+            "customer_cc": customer_cc,
+            "forwarded": 0,
+            "skipped": 0,
+            "failed": 0,
+            "failures": [],
+            "fatal_error": {
+                "type": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            },
+        },
+    )
 
 
 if __name__ == "__main__":
@@ -276,4 +525,10 @@ if __name__ == "__main__":
         help="Send unread messages to test_forward recipients and mark them read",
     )
     args = parser.parse_args()
-    main(dry_run=args.dry_run, test=args.test)
+    try:
+        main(dry_run=args.dry_run, test=args.test)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        _notify_fatal_error(exc, dry_run=args.dry_run, test=args.test)
+        raise SystemExit(1) from exc
