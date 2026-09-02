@@ -23,7 +23,8 @@ DEFAULT_FORWARD_SIGNATURE_NAME = (
 )
 
 ERROR_ALERT_SUBJECT = (
-    "[ACTION REQUIRED] Alert forwarder failed — send customer notification manually"
+    "[ACTION REQUIRED] PURE New Azure Sentinel Incident project forwarding script error "
+    "— send customer notification manually"
 )
 
 
@@ -73,6 +74,8 @@ def _format_recipient_list(addresses) -> str:
 
 def _build_error_alert_bodies(payload: dict) -> tuple[str, str]:
     action_lines = [
+        "PURE New Azure Sentinel Incident project forwarding script error",
+        "",
         "ACTION REQUIRED",
         "===============",
         (
@@ -123,6 +126,7 @@ def _build_error_alert_bodies(payload: dict) -> tuple[str, str]:
     text_body = "\n".join(action_lines)
 
     html_parts = [
+        "<h3>PURE New Azure Sentinel Incident project forwarding script error</h3>",
         "<h2 style=\"color:#b91c1c;\">ACTION REQUIRED</h2>",
         (
             "<p><strong>Automatic customer notification failed.</strong> "
@@ -198,10 +202,10 @@ def send_error_alert(client, error_to, payload: dict) -> None:
     )
 
 
-def notify_soc_on_error(*, error_to, payload: dict, client=None) -> None:
+def notify_soc_on_error(*, error_to, payload: dict, client=None) -> bool:
     if not error_to:
         print("WARNING: error_to is empty; SOC alert email not sent")
-        return
+        return False
 
     try:
         if client is None:
@@ -211,8 +215,10 @@ def notify_soc_on_error(*, error_to, payload: dict, client=None) -> None:
         else:
             send_error_alert(client, error_to, payload)
         print(f"SOC alert sent to error_to={error_to}")
+        return True
     except Exception as exc:
         print(f"WARNING: failed to send SOC alert email: {exc}")
+        return False
 
 
 def _error_alert_context(
@@ -232,6 +238,35 @@ def _error_alert_context(
         customer_to = forward_cfg.get("to") or []
         customer_cc = forward_cfg.get("cc") or []
     return error_to, customer_to, customer_cc
+
+
+def send_error_template() -> None:
+    app_cfg = load_config()
+    error_to, customer_to, customer_cc = _error_alert_context(
+        app_cfg, dry_run=False, test=False
+    )
+    sent = notify_soc_on_error(
+        error_to=error_to,
+        payload={
+            "run_mode": "manual-error",
+            "customer_to": customer_to,
+            "customer_cc": customer_cc,
+            "forwarded": 0,
+            "skipped": 0,
+            "failed": 1,
+            "failures": [
+                {
+                    "id": "-",
+                    "subject": "Manual --error alert",
+                    "folder": "CLI",
+                    "error": "Manual error template requested via --error",
+                }
+            ],
+            "fatal_error": None,
+        },
+    )
+    if not sent:
+        raise SystemExit(1)
 
 
 def _forward_attachments(client, source):
@@ -524,9 +559,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Send unread messages to test_forward recipients and mark them read",
     )
+    mode.add_argument(
+        "--error",
+        action="store_true",
+        help="Send the error alert template to error_to without scanning messages",
+    )
     args = parser.parse_args()
     try:
-        main(dry_run=args.dry_run, test=args.test)
+        if args.error:
+            send_error_template()
+        else:
+            main(dry_run=args.dry_run, test=args.test)
     except SystemExit:
         raise
     except Exception as exc:
