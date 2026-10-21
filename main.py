@@ -1,4 +1,4 @@
-"""Scan unread Pure Fitness alerts and forward them."""
+"""Forward Pure Fitness alerts using durable send receipts, regardless of read flags."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from pathlib import Path
 from zimbra_client import Attachment, ZimbraClient
 
 from alert_html import SkipForward, clean_subject, prepare_send_bodies, sanitize_signature_html
+from send_history import SendHistory, forwarding_lock, mailbox_scope
 
 
 ROOT = Path(__file__).resolve().parent
@@ -24,7 +25,7 @@ DEFAULT_FORWARD_SIGNATURE_NAME = (
 
 ERROR_ALERT_SUBJECT = (
     "[ACTION REQUIRED] PURE New Azure Sentinel Incident project forwarding script error "
-    "— send customer notification manually"
+    "— verify delivery and notify customer if needed"
 )
 
 
@@ -79,8 +80,9 @@ def _build_error_alert_bodies(payload: dict) -> tuple[str, str]:
         "ACTION REQUIRED",
         "===============",
         (
-            "Automatic customer notification failed. The SOC team must manually send "
-            "the customer notification now. Do not assume the customer was notified."
+            "Forwarding or a post-send read-status update failed. "
+            "Check Sent before manually sending a notification. Notify the customer "
+            "only if delivery has not already been confirmed."
         ),
         "",
         f"Run mode: {payload.get('run_mode', 'unknown')}",
@@ -93,8 +95,8 @@ def _build_error_alert_bodies(payload: dict) -> tuple[str, str]:
         ),
         "",
         (
-            "Failed source messages were not marked read and remain unread in the "
-            "source folder."
+            "Read/unread status does not control forwarding. Check the send history "
+            "and Sent folder before manually retrying a pending send."
         ),
     ]
 
@@ -129,9 +131,9 @@ def _build_error_alert_bodies(payload: dict) -> tuple[str, str]:
         "<h3>PURE New Azure Sentinel Incident project forwarding script error</h3>",
         "<h2 style=\"color:#b91c1c;\">ACTION REQUIRED</h2>",
         (
-            "<p><strong>Automatic customer notification failed.</strong> "
-            "The SOC team must <strong>manually send the customer notification</strong> "
-            "now. Do not assume the customer was notified.</p>"
+            "<p><strong>Forwarding or a post-send read-status update failed.</strong> "
+            "Check Sent before manually sending a notification. Notify the customer "
+            "only if delivery has not already been confirmed.</p>"
         ),
         "<ul>",
         f"<li><strong>Run mode:</strong> {html.escape(str(payload.get('run_mode', 'unknown')))}</li>",
@@ -149,8 +151,8 @@ def _build_error_alert_bodies(payload: dict) -> tuple[str, str]:
         ),
         "</ul>",
         (
-            "<p>Failed source messages were <strong>not marked read</strong> and remain "
-            "unread in the source folder.</p>"
+            "<p>Read/unread status does not control forwarding. Check the send history "
+            "and Sent folder before manually retrying a <strong>pending send</strong>.</p>"
         ),
     ]
 
@@ -312,6 +314,7 @@ def forward_message(
     signature_id,
     signature_name,
     signature_position="down",
+    before_send=None,
 ):
     signature_text, signature_html = _signature_parts(client, signature_id, signature_name)
     source = client.get_message(message_id)
@@ -322,13 +325,17 @@ def forward_message(
         signature_html=signature_html,
         signature_position=signature_position,
     )
+    attachments = _forward_attachments(client, source) or None
+    forward_subject = clean_subject(subject) or source.subject
+    if before_send is not None:
+        before_send()
     return client.send_message(
         to=to,
         cc=cc,
-        subject=clean_subject(subject) or source.subject,
+        subject=forward_subject,
         text=body_text,
         html=body_html,
-        attachments=_forward_attachments(client, source) or None,
+        attachments=attachments,
     )
 
 
@@ -356,12 +363,35 @@ def resolve_folder_id(client, parent_id: str, folder_name: str) -> str:
     return matches[0].id
 
 
-def main(*, dry_run: bool = False, test: bool = False) -> None:
-    if dry_run and test:
-        raise ValueError("Use only one of --dry-run or --test")
+def iter_folder_messages(client, folder_id: str, page_size: int):
+    offset = 0
+    while True:
+        results = client.search_messages(
+            query="", folder_id=folder_id, limit=page_size,
+            offset=offset, sort_by="dateAsc",
+        )
+        yield from results.messages
+        if not results.more:
+            break
+        if not results.messages:
+            raise RuntimeError("Mailbox search returned an empty page with more=true")
+        offset += len(results.messages)
 
-    load_env()
-    app_cfg = load_config()
+
+def _mark_forwarded_read(client, source_id) -> None:
+    """Update read status only after the successful send has been recorded."""
+    try:
+        client.mark_read(source_id)
+    except Exception as exc:
+        raise RuntimeError(
+            "Forwarding already confirmed and recorded, but marking the source "
+            f"read failed: {exc}. The read-status update will retry on the next "
+            "run; do not resend the email."
+        ) from exc
+    print(f"READ id={source_id} forwarding already confirmed")
+
+
+def _run_forwarding(app_cfg, zimbra_cfg, history, *, dry_run=False, test=False) -> None:
     error_to, customer_to, customer_cc = _error_alert_context(
         app_cfg, dry_run=dry_run, test=test
     )
@@ -373,6 +403,8 @@ def main(*, dry_run: bool = False, test: bool = False) -> None:
     forward_cfg = app_cfg.get("forward") or {}
     test_forward_cfg = app_cfg.get("test_forward") or {}
     limit = int(forward_cfg.get("limit") or 50)
+    if limit <= 0:
+        raise ValueError("forward.limit must be positive")
     signature_id = str(forward_cfg.get("signature_id") or DEFAULT_FORWARD_SIGNATURE_ID).strip()
     signature_name = str(forward_cfg.get("signature_name") or DEFAULT_FORWARD_SIGNATURE_NAME).strip()
     signature_position = str(forward_cfg.get("signature_position") or "down").strip().lower()
@@ -391,25 +423,17 @@ def main(*, dry_run: bool = False, test: bool = False) -> None:
         if not to_addrs:
             raise ValueError("Missing forward.to recipients in config.json")
 
-    if dry_run:
-        search_query = ""
-        search_limit = 1
-    else:
-        search_query = "is:unread"
-        search_limit = limit
-
-    zimbra_cfg = _zimbra_config_from_env()
     with ZimbraClient(zimbra_cfg) as client:
         print(f"Zimbra login OK for {client.config.email}")
         if dry_run:
             print(
-                "DRY-RUN mode: ignore unread filter, send one message to "
-                "test_forward recipients, and do not mark it read"
+                "DRY-RUN mode: send one unrecorded message to test_forward recipients; "
+                "use separate send history and preserve read/unread status"
             )
         elif test:
             print(
-                "TEST mode: unread only, send to test_forward recipients, "
-                "and mark messages read"
+                "TEST mode: send unrecorded messages to test_forward recipients; "
+                "use separate send history and preserve read/unread status"
             )
         print(f"Forward to={to_addrs} cc={cc_addrs}")
         print(
@@ -420,6 +444,7 @@ def main(*, dry_run: bool = False, test: bool = False) -> None:
         forwarded = 0
         failed = 0
         skipped = 0
+        already_sent = 0
         failure_details: list[dict] = []
         for index, folder_cfg in enumerate(folders_cfg, start=1):
             if not isinstance(folder_cfg, dict):
@@ -439,22 +464,25 @@ def main(*, dry_run: bool = False, test: bool = False) -> None:
                 )
 
             folder_label = folder_name or folder_id
-            scan_label = "any" if dry_run else "unread"
             print(
-                f"Scanning {scan_label} in folder name={folder_name or '-'} "
-                f"parent_id={parent_id or '-'} id={folder_id} (limit={search_limit})"
+                f"Scanning all messages in folder name={folder_name or '-'} "
+                f"parent_id={parent_id or '-'} id={folder_id} (send limit={limit})"
             )
-            results = client.search_messages(
-                query=search_query, folder_id=folder_id, limit=search_limit
-            )
-            if not results.messages:
-                print(f"No {scan_label} messages found.")
-                continue
-
-            print(f"Found {len(results.messages)} {scan_label} message(s)")
-            for summary in results.messages:
+            folder_forwarded = 0
+            for summary in iter_folder_messages(client, folder_id, limit):
+                state = history.status(summary.id)
                 try:
-                    forward_message(
+                    if state == "sent":
+                        already_sent += 1
+                        if not use_test_recipients and summary.unread:
+                            _mark_forwarded_read(client, summary.id)
+                        continue
+                    if state == "pending":
+                        raise RuntimeError(
+                            "Previous send outcome is unconfirmed. Check Sent and the "
+                            "pending history record before retrying; automatic resend blocked."
+                        )
+                    receipt = forward_message(
                         client,
                         summary.id,
                         summary.subject,
@@ -463,17 +491,20 @@ def main(*, dry_run: bool = False, test: bool = False) -> None:
                         signature_id=signature_id,
                         signature_name=signature_name,
                         signature_position=signature_position,
+                        before_send=lambda source_id=summary.id: history.begin_send(source_id),
                     )
+                    history.confirm_sent(summary.id, getattr(receipt, "message_id", ""))
+                    forwarded += 1
+                    folder_forwarded += 1
+                    if not use_test_recipients:
+                        _mark_forwarded_read(client, summary.id)
                     if dry_run:
-                        forwarded += 1
                         print(
                             f"DRY-RUN OK  id={summary.id} subject={summary.subject!r} "
                             f"to={to_addrs} cc={cc_addrs}"
                         )
                         break
 
-                    client.mark_read(summary.id)
-                    forwarded += 1
                     prefix = "TEST OK" if test else "OK"
                     print(f"{prefix}  id={summary.id} subject={summary.subject!r}")
                 except SkipForward as exc:
@@ -491,10 +522,16 @@ def main(*, dry_run: bool = False, test: bool = False) -> None:
                     )
                     print(f"FAIL id={summary.id} subject={summary.subject!r} error={exc}")
 
+                if folder_forwarded >= limit:
+                    break
+
             if dry_run and forwarded:
                 break
 
-        print(f"Done. forwarded={forwarded} skipped={skipped} failed={failed}")
+        print(
+            f"Done. forwarded={forwarded} skipped={skipped} "
+            f"failed={failed} already_sent={already_sent}"
+        )
 
         if failed > 0:
             notify_soc_on_error(
@@ -512,6 +549,25 @@ def main(*, dry_run: bool = False, test: bool = False) -> None:
                 },
             )
             raise SystemExit(1)
+
+
+def main(*, dry_run: bool = False, test: bool = False) -> None:
+    if dry_run and test:
+        raise ValueError("Use only one of --dry-run or --test")
+    load_env()
+    app_cfg = load_config()
+    zimbra_cfg = _zimbra_config_from_env()
+    mode = "dry-run" if dry_run else "test" if test else "production"
+    with forwarding_lock(ROOT / ".forwarding.lock") as acquired:
+        if not acquired:
+            print("Another forwarding run is active; skipping this run")
+            return
+        with SendHistory(ROOT / "forwarding_state.sqlite3", mailbox_scope(zimbra_cfg, mode)) as history:
+            if mode == "production":
+                imported = history.import_legacy_successes(ROOT / "error.log")
+                if imported:
+                    print(f"Imported {imported} confirmed successful sends from the legacy log")
+            _run_forwarding(app_cfg, zimbra_cfg, history, dry_run=dry_run, test=test)
 
 
 def _notify_fatal_error(exc: BaseException, *, dry_run: bool, test: bool) -> None:
@@ -547,17 +603,17 @@ def _notify_fatal_error(exc: BaseException, *, dry_run: bool, test: bool) -> Non
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Scan unread alerts and forward them.")
+    parser = argparse.ArgumentParser(description="Forward alerts using persistent send history.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--dry-run",
         action="store_true",
-        help="Send one message (read or unread) to test_forward recipients without marking it read",
+        help="Send one unrecorded message to test recipients using separate send history; this sends email",
     )
     mode.add_argument(
         "--test",
         action="store_true",
-        help="Send unread messages to test_forward recipients and mark them read",
+        help="Send unrecorded messages to test recipients using separate send history; preserve read status",
     )
     mode.add_argument(
         "--error",
